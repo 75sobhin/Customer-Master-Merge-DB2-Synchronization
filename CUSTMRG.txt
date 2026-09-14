@@ -1,0 +1,661 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. CUSTMERG.
+       AUTHOR.     SOBHIN O V.
+
+      ************************************************************
+      * PROGRAM      : CUSTMERG
+      * PURPOSE      : Merge duplicate customer records (from a
+      *                sequential file) into the CUSTOMER-MASTER VSAM
+      *                KSDS following bank-merger business rules.
+      * INPUT        : DUPLICATE-CUSTOMERS (Sequential)
+      * I/O          : CUSTOMER-MASTER     (VSAM KSDS, Dynamic access)
+      * OUTPUT       : MERGE-AUDIT         (Sequential)
+      *                ERROR-REPORT        (Sequential)	
+      *****************************************************************
+
+       ENVIRONMENT DIVISION.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+
+           SELECT CUSTOMER-MASTER ASSIGN TO CUSTMAS
+               ORGANIZATION IS INDEXED
+               ACCESS MODE IS DYNAMIC
+               RECORD KEY IS CM-CUSTOMER-ID
+               FILE STATUS IS WS-CM-STATUS.
+
+           SELECT DUPLICATE-CUSTOMERS ASSIGN TO DUPCUST
+               ORGANIZATION IS SEQUENTIAL
+               FILE STATUS IS WS-DC-STATUS.
+
+           SELECT MERGE-AUDIT ASSIGN TO MRGAUDIT
+               ORGANIZATION IS SEQUENTIAL
+               FILE STATUS IS WS-MA-STATUS.
+
+           SELECT ERROR-REPORT ASSIGN TO ERRRPT
+               ORGANIZATION IS SEQUENTIAL
+               FILE STATUS IS WS-ER-STATUS.
+
+       DATA DIVISION.
+       FILE SECTION.
+
+      ******************************************************************
+      * CUSTOMER MASTER (VSAM KSDS) - RECORD LAYOUT
+      * NOTE: CM-ACCOUNT-BALANCE is plain DISPLAY (zoned) - NO COMP-3.
+      ******************************************************************
+       FD  CUSTOMER-MASTER
+           RECORD CONTAINS 190 CHARACTERS.
+       01  CUSTOMER-MASTER-RECORD.
+           05  CM-CUSTOMER-ID          PIC X(10).
+           05  CM-CUSTOMER-NAME        PIC X(30).
+           05  CM-DATE-OF-BIRTH        PIC X(10).
+           05  CM-PAN-NUMBER           PIC X(10).
+           05  CM-MOBILE-NUMBER        PIC X(10).
+           05  CM-ADDRESS              PIC X(100).
+           05  CM-ACCOUNT-BALANCE      PIC S9(9)V99.
+           05  CM-LAST-UPDATE-DATE     PIC X(8).
+           05  CM-STATUS               PIC X(01).
+
+      ******************************************************************
+      * DUPLICATE CUSTOMERS (SEQUENTIAL) - SAME LAYOUT AS MASTER
+      * NOTE: DC-ACCOUNT-BALANCE is plain DISPLAY (zoned) - NO COMP-3.
+      ******************************************************************
+       FD  DUPLICATE-CUSTOMERS
+           RECORD CONTAINS 190 CHARACTERS.
+       01  DUPLICATE-CUSTOMER-RECORD.
+           05  DC-CUSTOMER-ID          PIC X(10).
+           05  DC-CUSTOMER-NAME        PIC X(30).
+           05  DC-DATE-OF-BIRTH        PIC X(10).
+           05  DC-PAN-NUMBER           PIC X(10).
+           05  DC-MOBILE-NUMBER        PIC X(10).
+           05  DC-ADDRESS              PIC X(100).
+           05  DC-ACCOUNT-BALANCE      PIC S9(9)V99.
+           05  DC-LAST-UPDATE-DATE     PIC X(8).
+           05  DC-STATUS               PIC X(01).
+
+      ******************************************************************
+      * MERGE AUDIT FILE
+      ******************************************************************
+       FD  MERGE-AUDIT
+           RECORD CONTAINS 46 CHARACTERS.
+       01  MERGE-AUDIT-RECORD.
+           05  MA-CUSTOMER-ID          PIC X(10).
+           05  MA-OLD-BALANCE          PIC S9(9)V99.
+           05  MA-NEW-BALANCE          PIC S9(9)V99.
+           05  MA-MERGE-DATE           PIC X(08).
+           05  MA-ACTION               PIC X(06).
+
+      ******************************************************************
+      * ERROR REPORT FILE
+      ******************************************************************
+       FD  ERROR-REPORT
+           RECORD CONTAINS 182 CHARACTERS.
+       01  ERROR-REPORT-RECORD.
+           05  ER-CUSTOMER-ID          PIC X(10).
+           05  ER-REASON               PIC X(60).
+           05  ER-CUSTOMER-NAME        PIC X(30).
+           05  ER-PAN-NUMBER           PIC X(10).
+           05  ER-ACCOUNT-BALANCE      PIC S9(9)V99.
+           05  ER-LAST-UPDATE-DATE     PIC X(08).
+           05  ER-FILLER               PIC X(53).
+
+       WORKING-STORAGE SECTION.
+
+      ******************************************************************
+      * FILE STATUS FIELDS
+      ******************************************************************
+       01  WS-FILE-STATUSES.
+           05  WS-CM-STATUS            PIC XX     VALUE SPACES.
+               88  CM-SUCCESS                     VALUE '00'.
+               88  CM-EOF                          VALUE '10'.
+               88  CM-DUPLICATE-KEY                VALUE '22'.
+               88  CM-NOT-FOUND                    VALUE '23'.
+               88  CM-LOGICAL-ERROR                VALUE '92'.
+               88  CM-RESOURCE-UNAVAIL             VALUE '93'.
+           05  WS-DC-STATUS            PIC XX     VALUE SPACES.
+               88  DC-SUCCESS                      VALUE '00'.
+               88  DC-EOF                          VALUE '10'.
+           05  WS-MA-STATUS            PIC XX     VALUE SPACES.
+               88  MA-SUCCESS                      VALUE '00'.
+           05  WS-ER-STATUS            PIC XX     VALUE SPACES.
+               88  ER-SUCCESS                      VALUE '00'.
+
+      ******************************************************************
+      * SWITCHES
+      ******************************************************************
+       01  WS-SWITCHES.
+           05  WS-EOF-SWITCH           PIC X(01)  VALUE 'N'.
+               88  END-OF-DUPLICATE-FILE           VALUE 'Y'.
+           05  WS-VALID-SWITCH         PIC X(01)  VALUE 'Y'.
+               88  RECORD-IS-VALID                 VALUE 'Y'.
+               88  RECORD-IS-INVALID               VALUE 'N'.
+           05  WS-CUSTOMER-FOUND-SW    PIC X(01)  VALUE 'N'.
+               88  CUSTOMER-FOUND                  VALUE 'Y'.
+               88  CUSTOMER-NOT-FOUND              VALUE 'N'.
+           05  WS-SIZE-ERROR-SW        PIC X(01)  VALUE 'N'.
+               88  SIZE-ERROR-OCCURRED             VALUE 'Y'.
+
+      ******************************************************************
+      * FATAL / FILE-OPENED SWITCHES - prevent CLOSE of a file that was
+      * never OPENed, and prevent any I/O once a fatal condition (a
+      * file failed to open, or VSAM returned 92/93) has been raised.
+      * This is the key control that keeps the whole job from abending
+      * instead of ending gracefully with a clear message + totals.
+      ******************************************************************
+       01  WS-CONTROL-SWITCHES.
+           05  WS-FATAL-SWITCH         PIC X(01)  VALUE 'N'.
+               88  FATAL-ERROR-OCCURRED            VALUE 'Y'.
+           05  WS-CM-OPENED-SW         PIC X(01)  VALUE 'N'.
+               88  CM-FILE-OPENED                  VALUE 'Y'.
+           05  WS-DC-OPENED-SW         PIC X(01)  VALUE 'N'.
+               88  DC-FILE-OPENED                  VALUE 'Y'.
+           05  WS-MA-OPENED-SW         PIC X(01)  VALUE 'N'.
+               88  MA-FILE-OPENED                  VALUE 'Y'.
+           05  WS-ER-OPENED-SW         PIC X(01)  VALUE 'N'.
+               88  ER-FILE-OPENED                  VALUE 'Y'.
+
+      ******************************************************************
+      * COUNTERS
+      ******************************************************************
+       01  WS-COUNTERS.
+           05  WS-TOTAL-READ           PIC 9(07)  VALUE ZERO.
+           05  WS-TOTAL-INSERTED       PIC 9(07)  VALUE ZERO.
+           05  WS-TOTAL-MERGED         PIC 9(07)  VALUE ZERO.
+           05  WS-TOTAL-REJECTED       PIC 9(07)  VALUE ZERO.
+           05  WS-TOTAL-PAN-MISMATCH   PIC 9(07)  VALUE ZERO.
+           05  WS-TOTAL-AUDIT-WRITTEN  PIC 9(07)  VALUE ZERO.
+           05  WS-TOTAL-ERRORS         PIC 9(07)  VALUE ZERO.
+
+      ******************************************************************
+      * MISC WORK FIELDS
+      ******************************************************************
+       01  WS-WORK-FIELDS.
+           05  WS-REJECT-REASON        PIC X(60)  VALUE SPACES.
+           05  WS-SAVE-OLD-BALANCE     PIC S9(9)V99 VALUE ZERO.
+           05  WS-SAVE-NEW-BALANCE     PIC S9(9)V99 VALUE ZERO.
+           05  WS-CURRENT-DATE-8       PIC X(08)  VALUE SPACES.
+           05  WS-CM-NAME-LEN          PIC 9(03)  VALUE ZERO.
+           05  WS-DC-NAME-LEN          PIC 9(03)  VALUE ZERO.
+           05  WS-YYYY                 PIC 9(04)  VALUE ZERO.
+           05  WS-MM                   PIC 9(02)  VALUE ZERO.
+           05  WS-DD                   PIC 9(02)  VALUE ZERO.
+           05  WS-DATE-NUMERIC-TEST    PIC 9(08)  VALUE ZERO.
+
+       01  WS-CURRENT-DATE-TIME.
+           05  WS-CURR-YYYY            PIC 9(04).
+           05  WS-CURR-MM              PIC 9(02).
+           05  WS-CURR-DD              PIC 9(02).
+           05  FILLER                  PIC X(10).
+
+       PROCEDURE DIVISION.
+
+      ******************************************************************
+      * 0000-MAIN-PARAGRAPH - Top level control
+      * Processing (and even the totals display) is skipped entirely
+      * if a fatal condition was raised during initialization, but
+      * termination/cleanup ALWAYS runs so open files are always
+      * closed properly.
+      ******************************************************************
+       0000-MAIN-PARAGRAPH.
+           PERFORM 1000-INITIALIZE
+
+           IF NOT FATAL-ERROR-OCCURRED
+               PERFORM 2000-PROCESS-RECORDS
+                   UNTIL END-OF-DUPLICATE-FILE
+                      OR FATAL-ERROR-OCCURRED
+               PERFORM 3000-DISPLAY-TOTALS
+           ELSE
+               DISPLAY '*** CUSTMERG ENDED EARLY DUE TO A FATAL '
+                   'ERROR - SEE MESSAGES ABOVE ***'
+           END-IF
+
+           PERFORM 9999-TERMINATE
+           GOBACK.
+
+      ******************************************************************
+      * 1000-INITIALIZE - Open files and get run date. Every OPEN is
+      * checked independently; failure of one does not stop us from
+      * attempting the others (so the operator sees every problem at
+      * once), but it DOES raise the fatal switch so no READ/WRITE/
+      * REWRITE is ever attempted, and 9999-TERMINATE will only CLOSE
+      * the files that actually opened.
+      ******************************************************************
+       1000-INITIALIZE.
+           MOVE FUNCTION CURRENT-DATE TO WS-CURRENT-DATE-TIME
+           STRING WS-CURR-YYYY WS-CURR-MM WS-CURR-DD
+               DELIMITED BY SIZE INTO WS-CURRENT-DATE-8
+           END-STRING
+
+           OPEN I-O   CUSTOMER-MASTER
+           EVALUATE TRUE
+               WHEN CM-SUCCESS
+                   SET CM-FILE-OPENED TO TRUE
+               WHEN OTHER
+                   DISPLAY 'ERROR OPENING CUSTOMER-MASTER. STATUS='
+                       WS-CM-STATUS
+                   SET FATAL-ERROR-OCCURRED TO TRUE
+           END-EVALUATE
+
+           OPEN INPUT  DUPLICATE-CUSTOMERS
+           EVALUATE TRUE
+               WHEN DC-SUCCESS
+                   SET DC-FILE-OPENED TO TRUE
+               WHEN OTHER
+                   DISPLAY 'ERROR OPENING DUPLICATE-CUSTOMERS. STATUS='
+                       WS-DC-STATUS
+                   SET FATAL-ERROR-OCCURRED TO TRUE
+           END-EVALUATE
+
+           OPEN OUTPUT MERGE-AUDIT
+           EVALUATE TRUE
+               WHEN MA-SUCCESS
+                   SET MA-FILE-OPENED TO TRUE
+               WHEN OTHER
+                   DISPLAY 'ERROR OPENING MERGE-AUDIT. STATUS='
+                       WS-MA-STATUS
+                   SET FATAL-ERROR-OCCURRED TO TRUE
+           END-EVALUATE
+
+           OPEN OUTPUT ERROR-REPORT
+           EVALUATE TRUE
+               WHEN ER-SUCCESS
+                   SET ER-FILE-OPENED TO TRUE
+               WHEN OTHER
+                   DISPLAY 'ERROR OPENING ERROR-REPORT. STATUS='
+                       WS-ER-STATUS
+                   SET FATAL-ERROR-OCCURRED TO TRUE
+           END-EVALUATE
+
+           IF NOT FATAL-ERROR-OCCURRED
+               PERFORM 2100-READ-DUPLICATE
+           END-IF.
+
+      ******************************************************************
+      * 2000-PROCESS-RECORDS - Main driving loop, one dup record/pass
+      ******************************************************************
+       2000-PROCESS-RECORDS.
+           ADD 1 TO WS-TOTAL-READ
+           SET RECORD-IS-VALID   TO TRUE
+           MOVE SPACES           TO WS-REJECT-REASON
+
+           PERFORM 2200-VALIDATE-RECORD
+
+           IF RECORD-IS-VALID
+               PERFORM 2300-PROCESS-CUSTOMER
+           ELSE
+               PERFORM 2700-WRITE-ERROR
+           END-IF
+
+           IF NOT FATAL-ERROR-OCCURRED
+               PERFORM 2100-READ-DUPLICATE
+           END-IF.
+
+      ******************************************************************
+      * 2100-READ-DUPLICATE - Read next record from sequential input.
+      * Any status other than 00 (success) or 10 (EOF) is a hard read
+      * error on the input file - treated as fatal, since there is no
+      * safe way to keep reading a sequential file once the access
+      * method has reported a real I/O failure.
+      ******************************************************************
+       2100-READ-DUPLICATE.
+           READ DUPLICATE-CUSTOMERS
+               AT END
+                   SET END-OF-DUPLICATE-FILE TO TRUE
+               NOT AT END
+                   CONTINUE
+           END-READ
+
+           IF NOT DC-EOF AND NOT DC-SUCCESS
+               DISPLAY 'ERROR READING DUPLICATE-CUSTOMERS. STATUS='
+                   WS-DC-STATUS
+               SET FATAL-ERROR-OCCURRED TO TRUE
+           END-IF.
+
+      ******************************************************************
+      * 2200-VALIDATE-RECORD - Field-level validation of incoming
+      *                        duplicate record (before master lookup).
+      * ACCOUNT-BALANCE is now tested with "IS NUMERIC" BEFORE it is
+      * ever compared or used in arithmetic anywhere else in the
+      * program - this class test is 100% abend-safe even if the
+      * field contains spaces, low-values, or garbage characters, and
+      * is exactly what stops a bad balance from ever reaching an ADD
+      * or COMPUTE statement further down the line.
+      ******************************************************************
+       2200-VALIDATE-RECORD.
+
+           IF DC-CUSTOMER-ID = SPACES OR LOW-VALUES
+               SET RECORD-IS-INVALID TO TRUE
+               MOVE 'CUSTOMER-ID IS BLANK' TO WS-REJECT-REASON
+           END-IF
+
+           IF RECORD-IS-VALID
+               IF DC-CUSTOMER-NAME = SPACES OR LOW-VALUES
+                   SET RECORD-IS-INVALID TO TRUE
+                   MOVE 'CUSTOMER-NAME IS BLANK' TO WS-REJECT-REASON
+               END-IF
+           END-IF
+
+           IF RECORD-IS-VALID
+               IF DC-ACCOUNT-BALANCE IS NOT NUMERIC
+                   SET RECORD-IS-INVALID TO TRUE
+                   MOVE 'ACCOUNT-BALANCE IS NOT NUMERIC'
+                       TO WS-REJECT-REASON
+               ELSE
+                   IF DC-ACCOUNT-BALANCE < ZERO
+                       SET RECORD-IS-INVALID TO TRUE
+                       MOVE 'ACCOUNT-BALANCE IS NEGATIVE'
+                           TO WS-REJECT-REASON
+                   END-IF
+               END-IF
+           END-IF
+
+           IF RECORD-IS-VALID
+               PERFORM 2210-VALIDATE-DATE
+               IF RECORD-IS-INVALID
+                   MOVE 'LAST-UPDATE-DATE IS INVALID'
+                       TO WS-REJECT-REASON
+               END-IF
+           END-IF.
+
+      ******************************************************************
+      * 2210-VALIDATE-DATE - Basic YYYYMMDD sanity check. The
+      * "IS NOT NUMERIC" test is always performed BEFORE the field is
+      * moved into any numeric work field or reference-modified, so a
+      * non-numeric date can never reach an arithmetic/numeric-move
+      * statement.
+      ******************************************************************
+       2210-VALIDATE-DATE.
+           SET RECORD-IS-VALID TO TRUE
+
+           IF DC-LAST-UPDATE-DATE IS NOT NUMERIC
+               SET RECORD-IS-INVALID TO TRUE
+           ELSE
+               MOVE DC-LAST-UPDATE-DATE TO WS-DATE-NUMERIC-TEST
+               MOVE DC-LAST-UPDATE-DATE(1:4) TO WS-YYYY
+               MOVE DC-LAST-UPDATE-DATE(5:2) TO WS-MM
+               MOVE DC-LAST-UPDATE-DATE(7:2) TO WS-DD
+
+               IF WS-YYYY < 1900 OR WS-YYYY > 2099
+                   SET RECORD-IS-INVALID TO TRUE
+               END-IF
+               IF WS-MM < 01 OR WS-MM > 12
+                   SET RECORD-IS-INVALID TO TRUE
+               END-IF
+               IF WS-DD < 01 OR WS-DD > 31
+                   SET RECORD-IS-INVALID TO TRUE
+               END-IF
+           END-IF.
+
+      ******************************************************************
+      * 2300-PROCESS-CUSTOMER - Lookup master record and route to
+      * insert or merge logic. Status 92/93 from the VSAM READ is
+      * treated as fatal (the file itself is in trouble); every other
+      * non-success status is handled as a per-record rejection so one
+      * bad key never brings the job down.
+      ******************************************************************
+       2300-PROCESS-CUSTOMER.
+           MOVE DC-CUSTOMER-ID TO CM-CUSTOMER-ID
+
+           READ CUSTOMER-MASTER
+               INVALID KEY
+                   CONTINUE
+               NOT INVALID KEY
+                   CONTINUE
+           END-READ
+
+           EVALUATE TRUE
+               WHEN CM-SUCCESS
+                   PERFORM 2500-MERGE-CUSTOMER
+               WHEN CM-NOT-FOUND
+                   PERFORM 2400-INSERT-CUSTOMER
+               WHEN CM-LOGICAL-ERROR OR CM-RESOURCE-UNAVAIL
+                   DISPLAY 'FATAL VSAM ERROR READING CUSTOMER-MASTER. '
+                       'STATUS=' WS-CM-STATUS ' FOR ID=' DC-CUSTOMER-ID
+                   MOVE 'FATAL VSAM READ ERROR - RUN ABORTED'
+                       TO WS-REJECT-REASON
+                   PERFORM 2700-WRITE-ERROR
+                   SET FATAL-ERROR-OCCURRED TO TRUE
+               WHEN OTHER
+                   DISPLAY 'UNEXPECTED VSAM READ STATUS='
+                       WS-CM-STATUS ' FOR ID=' DC-CUSTOMER-ID
+                   MOVE 'VSAM READ ERROR' TO WS-REJECT-REASON
+                   PERFORM 2700-WRITE-ERROR
+           END-EVALUATE.
+
+      ******************************************************************
+      * 2400-INSERT-CUSTOMER - Brand new customer, write to master.
+      * DC-ACCOUNT-BALANCE has already passed the IS NUMERIC test in
+      * 2200-VALIDATE-RECORD, so this MOVE is safe.
+      ******************************************************************
+       2400-INSERT-CUSTOMER.
+           MOVE DC-CUSTOMER-ID         TO CM-CUSTOMER-ID
+           MOVE DC-CUSTOMER-NAME       TO CM-CUSTOMER-NAME
+           MOVE DC-DATE-OF-BIRTH       TO CM-DATE-OF-BIRTH
+           MOVE DC-PAN-NUMBER          TO CM-PAN-NUMBER
+           MOVE DC-MOBILE-NUMBER       TO CM-MOBILE-NUMBER
+           MOVE DC-ADDRESS             TO CM-ADDRESS
+           MOVE DC-ACCOUNT-BALANCE     TO CM-ACCOUNT-BALANCE
+           MOVE DC-LAST-UPDATE-DATE    TO CM-LAST-UPDATE-DATE
+           MOVE DC-STATUS              TO CM-STATUS
+
+           WRITE CUSTOMER-MASTER-RECORD
+
+           EVALUATE TRUE
+               WHEN CM-SUCCESS
+                   ADD 1 TO WS-TOTAL-INSERTED
+                   MOVE ZERO               TO WS-SAVE-OLD-BALANCE
+                   MOVE CM-ACCOUNT-BALANCE TO WS-SAVE-NEW-BALANCE
+                   MOVE 'INSERT'           TO MA-ACTION
+                   PERFORM 2600-WRITE-AUDIT
+               WHEN CM-DUPLICATE-KEY
+                   MOVE 'DUPLICATE KEY ON INSERT'
+                       TO WS-REJECT-REASON
+                   PERFORM 2700-WRITE-ERROR
+               WHEN CM-LOGICAL-ERROR OR CM-RESOURCE-UNAVAIL
+                   DISPLAY 'FATAL VSAM ERROR WRITING CUSTOMER-MASTER. '
+                       'STATUS=' WS-CM-STATUS ' FOR ID=' DC-CUSTOMER-ID
+                   MOVE 'FATAL VSAM WRITE ERROR - RUN ABORTED'
+                       TO WS-REJECT-REASON
+                   PERFORM 2700-WRITE-ERROR
+                   SET FATAL-ERROR-OCCURRED TO TRUE
+               WHEN OTHER
+                   DISPLAY 'ERROR WRITING CUSTOMER-MASTER. STATUS='
+                       WS-CM-STATUS ' FOR ID=' DC-CUSTOMER-ID
+                   MOVE 'VSAM WRITE ERROR' TO WS-REJECT-REASON
+                   PERFORM 2700-WRITE-ERROR
+           END-EVALUATE.
+
+      ******************************************************************
+      * 2500-MERGE-CUSTOMER - Existing customer, apply merge rules.
+      * CM-ACCOUNT-BALANCE (just read from the VSAM file) is re-checked
+      * with IS NUMERIC as a defensive measure before it is added to,
+      * in case the master file itself ever contains corrupted data.
+      * The balance addition itself uses COMPUTE ... ON SIZE ERROR so
+      * an overflow is rejected to ERROR-REPORT instead of abending or
+      * silently truncating.
+      ******************************************************************
+       2500-MERGE-CUSTOMER.
+           MOVE 'N' TO WS-SIZE-ERROR-SW
+
+      * --- PAN must match; reject if different --------------------
+           IF DC-PAN-NUMBER NOT = CM-PAN-NUMBER
+               ADD 1 TO WS-TOTAL-PAN-MISMATCH
+               MOVE 'PAN NUMBER MISMATCH' TO WS-REJECT-REASON
+               PERFORM 2700-WRITE-ERROR
+           ELSE
+               IF CM-ACCOUNT-BALANCE IS NOT NUMERIC
+                   MOVE 'MASTER ACCOUNT-BALANCE IS NOT NUMERIC'
+                       TO WS-REJECT-REASON
+                   PERFORM 2700-WRITE-ERROR
+               ELSE
+                   MOVE CM-ACCOUNT-BALANCE TO WS-SAVE-OLD-BALANCE
+
+      * --- Keep the longer CUSTOMER-NAME ---------------------------
+                   MOVE ZERO TO WS-CM-NAME-LEN
+                   INSPECT FUNCTION REVERSE(CM-CUSTOMER-NAME)
+                       TALLYING WS-CM-NAME-LEN
+                       FOR LEADING SPACES
+                   COMPUTE WS-CM-NAME-LEN =
+                       LENGTH OF CM-CUSTOMER-NAME - WS-CM-NAME-LEN
+
+                   MOVE ZERO TO WS-DC-NAME-LEN
+                   INSPECT FUNCTION REVERSE(DC-CUSTOMER-NAME)
+                       TALLYING WS-DC-NAME-LEN
+                       FOR LEADING SPACES
+                   COMPUTE WS-DC-NAME-LEN =
+                       LENGTH OF DC-CUSTOMER-NAME - WS-DC-NAME-LEN
+
+                   IF WS-DC-NAME-LEN > WS-CM-NAME-LEN
+                       MOVE DC-CUSTOMER-NAME TO CM-CUSTOMER-NAME
+                   END-IF
+
+      * --- Keep ADDRESS from record with latest LAST-UPDATE-DATE ---
+                   IF DC-LAST-UPDATE-DATE > CM-LAST-UPDATE-DATE
+                       MOVE DC-ADDRESS TO CM-ADDRESS
+                   END-IF
+
+      * --- Replace MOBILE-NUMBER if duplicate's is not blank -------
+                   IF DC-MOBILE-NUMBER NOT = SPACES
+                       MOVE DC-MOBILE-NUMBER TO CM-MOBILE-NUMBER
+                   END-IF
+
+      * --- Add balances (overflow-safe) ------------------------------
+                   COMPUTE CM-ACCOUNT-BALANCE =
+                       CM-ACCOUNT-BALANCE + DC-ACCOUNT-BALANCE
+                       ON SIZE ERROR
+                           MOVE 'Y' TO WS-SIZE-ERROR-SW
+                           MOVE 'BALANCE ADDITION CAUSED OVERFLOW'
+                               TO WS-REJECT-REASON
+                           PERFORM 2700-WRITE-ERROR
+                       NOT ON SIZE ERROR
+                           CONTINUE
+                   END-COMPUTE
+
+                   IF NOT SIZE-ERROR-OCCURRED
+      * --- STATUS = 'A' if either record is 'A' -------------------
+                       IF DC-STATUS = 'A' OR CM-STATUS = 'A'
+                           MOVE 'A' TO CM-STATUS
+                       ELSE
+                           MOVE 'I' TO CM-STATUS
+                       END-IF
+
+      * --- Keep the later LAST-UPDATE-DATE on the master -----------
+                       IF DC-LAST-UPDATE-DATE > CM-LAST-UPDATE-DATE
+                           MOVE DC-LAST-UPDATE-DATE
+                               TO CM-LAST-UPDATE-DATE
+                       END-IF
+
+                       REWRITE CUSTOMER-MASTER-RECORD
+
+                       EVALUATE TRUE
+                           WHEN CM-SUCCESS
+                               ADD 1 TO WS-TOTAL-MERGED
+                               MOVE CM-ACCOUNT-BALANCE
+                                   TO WS-SAVE-NEW-BALANCE
+                               MOVE 'MERGE' TO MA-ACTION
+                               PERFORM 2600-WRITE-AUDIT
+                           WHEN CM-LOGICAL-ERROR OR CM-RESOURCE-UNAVAIL
+                               DISPLAY
+                                   'FATAL VSAM ERROR REWRITING '
+                                   'CUSTOMER-MASTER. STATUS='
+                                   WS-CM-STATUS ' FOR ID='
+                                   DC-CUSTOMER-ID
+                               MOVE
+                                'FATAL VSAM REWRITE ERROR - RUN ABORTED'
+                                   TO WS-REJECT-REASON
+                               PERFORM 2700-WRITE-ERROR
+                               SET FATAL-ERROR-OCCURRED TO TRUE
+                           WHEN OTHER
+                               DISPLAY 'ERROR REWRITING CUSTOMER-MASTER'
+                                   '. STATUS=' WS-CM-STATUS
+                                   ' FOR ID=' DC-CUSTOMER-ID
+                               MOVE 'VSAM REWRITE ERROR'
+                                   TO WS-REJECT-REASON
+                               PERFORM 2700-WRITE-ERROR
+                       END-EVALUATE
+                   END-IF
+               END-IF
+           END-IF.
+
+      ******************************************************************
+      * 2600-WRITE-AUDIT - One audit record per successful insert/merge
+      ******************************************************************
+       2600-WRITE-AUDIT.
+           MOVE DC-CUSTOMER-ID        TO MA-CUSTOMER-ID
+           MOVE WS-SAVE-OLD-BALANCE   TO MA-OLD-BALANCE
+           MOVE WS-SAVE-NEW-BALANCE   TO MA-NEW-BALANCE
+           MOVE WS-CURRENT-DATE-8     TO MA-MERGE-DATE
+
+           WRITE MERGE-AUDIT-RECORD
+
+           IF MA-SUCCESS
+               ADD 1 TO WS-TOTAL-AUDIT-WRITTEN
+           ELSE
+               DISPLAY 'ERROR WRITING MERGE-AUDIT. STATUS='
+                   WS-MA-STATUS ' FOR ID=' DC-CUSTOMER-ID
+               ADD 1 TO WS-TOTAL-ERRORS
+           END-IF.
+
+      ******************************************************************
+      * 2700-WRITE-ERROR - Reject record with reason to ERROR-REPORT
+      ******************************************************************
+       2700-WRITE-ERROR.
+           ADD 1 TO WS-TOTAL-REJECTED
+           ADD 1 TO WS-TOTAL-ERRORS
+
+           MOVE DC-CUSTOMER-ID         TO ER-CUSTOMER-ID
+           MOVE WS-REJECT-REASON       TO ER-REASON
+           MOVE DC-CUSTOMER-NAME       TO ER-CUSTOMER-NAME
+           MOVE DC-PAN-NUMBER          TO ER-PAN-NUMBER
+           MOVE DC-LAST-UPDATE-DATE    TO ER-LAST-UPDATE-DATE
+           MOVE SPACES                 TO ER-FILLER
+
+           IF DC-ACCOUNT-BALANCE IS NUMERIC
+               MOVE DC-ACCOUNT-BALANCE TO ER-ACCOUNT-BALANCE
+           ELSE
+               MOVE ZERO               TO ER-ACCOUNT-BALANCE
+           END-IF
+
+           WRITE ERROR-REPORT-RECORD
+
+           IF NOT ER-SUCCESS
+               DISPLAY 'ERROR WRITING ERROR-REPORT. STATUS='
+                   WS-ER-STATUS ' FOR ID=' DC-CUSTOMER-ID
+           END-IF.
+
+      ******************************************************************
+      * 3000-DISPLAY-TOTALS - End of job summary
+      ******************************************************************
+       3000-DISPLAY-TOTALS.
+           DISPLAY '=========================================='
+           DISPLAY '  CUSTOMER MASTER MERGE - RUN SUMMARY'
+           DISPLAY '=========================================='
+           DISPLAY '  TOTAL RECORDS READ      : ' WS-TOTAL-READ
+           DISPLAY '  RECORDS INSERTED        : ' WS-TOTAL-INSERTED
+           DISPLAY '  RECORDS MERGED          : ' WS-TOTAL-MERGED
+           DISPLAY '  RECORDS REJECTED        : ' WS-TOTAL-REJECTED
+           DISPLAY '  PAN MISMATCHES          : '
+               WS-TOTAL-PAN-MISMATCH
+           DISPLAY '  AUDIT RECORDS WRITTEN   : '
+               WS-TOTAL-AUDIT-WRITTEN
+           DISPLAY '  TOTAL ERRORS            : ' WS-TOTAL-ERRORS
+           DISPLAY '=========================================='.
+
+      ******************************************************************
+      * 9999-TERMINATE - Close only the files that were actually
+      * OPENed successfully, then end the job. This runs unconditionally
+      * from 0000-MAIN-PARAGRAPH, fatal error or not, so no file is
+      * ever left open.
+      ******************************************************************
+       9999-TERMINATE.
+           IF CM-FILE-OPENED
+               CLOSE CUSTOMER-MASTER
+           END-IF
+           IF DC-FILE-OPENED
+               CLOSE DUPLICATE-CUSTOMERS
+           END-IF
+           IF MA-FILE-OPENED
+               CLOSE MERGE-AUDIT
+           END-IF
+           IF ER-FILE-OPENED
+               CLOSE ERROR-REPORT
+           END-IF.
